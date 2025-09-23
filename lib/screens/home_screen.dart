@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:soft_electronics/screens/measurement_screen_fixed.dart';
-import '../screens/report_screen.dart';
+import '../screens/weekly_report_screen.dart';
 
 class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key});
@@ -135,11 +135,7 @@ class HomeScreen extends StatelessWidget {
                           Navigator.push(
                             context,
                             MaterialPageRoute(
-                              builder:
-                                  (context) => Scaffold(
-                                    appBar: AppBar(title: Text('리포트')),
-                                    body: Center(child: Text('리포트 화면')),
-                                  ),
+                              builder: (context) => const WeeklyReportScreen(),
                             ),
                           );
                         },

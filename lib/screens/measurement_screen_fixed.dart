@@ -4,7 +4,6 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'dart:async';
 import 'dart:convert';
-import 'report_screen.dart';
 
 class MeasurementScreenFixed extends StatefulWidget {
   const MeasurementScreenFixed({super.key});
@@ -15,7 +14,7 @@ class MeasurementScreenFixed extends StatefulWidget {
 
 class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
     with TickerProviderStateMixin {
-  // 블루투스 관련 변수 - 두 개의 HC-06 모듈 지원
+  // 블루투스 관련 변수 - IMU 및 FSR 모듈 지원
   List<BluetoothDevice> _devicesList = [];
   BluetoothDevice? _imuDevice;
   BluetoothDevice? _fsrDevice;
@@ -54,6 +53,10 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
   List<Map<String, dynamic>> _windowData = [];
   Timer? _dataWindowTimer;
   int _dataId = 1;
+
+  // 타임스탬프별 데이터 페어링을 위한 변수
+  Map<int, Map<String, dynamic>> _timestampPairs = {};
+  Timer? _pairingCleanupTimer;
 
   // 애니메이션 관련 변수
   late AnimationController _pulseController;
@@ -97,6 +100,33 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
       return 'FSR 연결됨';
     }
     return '';
+  }
+
+  // 장치 타입 라벨 반환 함수
+  String _getDeviceTypeLabel(BluetoothDevice device) {
+    String deviceName =
+        device.platformName.isNotEmpty
+            ? device.platformName
+            : device.remoteId.str;
+
+    // 연결된 장치의 경우 실제 타입 반환
+    if (_imuDevice?.remoteId.str == device.remoteId.str) {
+      return 'IMU';
+    } else if (_fsrDevice?.remoteId.str == device.remoteId.str) {
+      return 'FSR';
+    }
+
+    // 연결되지 않은 장치의 경우 이름 기반으로 추정
+    String upperName = deviceName.toUpperCase();
+    if (upperName.contains('IMU')) {
+      return 'IMU';
+    } else if (upperName.contains('FSR')) {
+      return 'FSR';
+    } else if (upperName.contains('HC-06') || upperName.contains('HC06')) {
+      return 'HC-06';
+    }
+
+    return 'MODULE';
   }
 
   @override
@@ -207,6 +237,30 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
             }
           }
 
+          // FSR, IMU, HC-06 모듈을 최상단에 정렬
+          uniqueDevices.sort((a, b) {
+            String nameA = a.platformName.toUpperCase();
+            String nameB = b.platformName.toUpperCase();
+
+            bool isTargetA =
+                nameA.contains('FSR') ||
+                nameA.contains('IMU') ||
+                nameA.contains('HC-06') ||
+                nameA.contains('HC06');
+            bool isTargetB =
+                nameB.contains('FSR') ||
+                nameB.contains('IMU') ||
+                nameB.contains('HC-06') ||
+                nameB.contains('HC06');
+
+            // FSR, IMU, HC-06 모듈이 먼저 오도록 정렬
+            if (isTargetA && !isTargetB) return -1;
+            if (!isTargetA && isTargetB) return 1;
+
+            // 모두 타겟 모듈이거나 모두 아닌 경우 이름순 정렬
+            return nameA.compareTo(nameB);
+          });
+
           if (mounted) {
             setState(() {
               _devicesList = uniqueDevices;
@@ -263,22 +317,52 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
     });
 
     try {
-      // 빈 슬롯 찾기 (IMU 또는 FSR)
-      bool connectAsIMU = (_imuDevice == null);
-      bool connectAsFSR = (_fsrDevice == null && !connectAsIMU);
-
-      if (!connectAsIMU && !connectAsFSR) {
-        setState(() {
-          _isConnecting = false;
-          _currentPosture = '이미 두 모듈이 모두 연결되어 있습니다. 기존 연결을 해제하고 다시 시도하세요.';
-        });
-        return;
+      // 기기 이름을 기반으로 모듈 타입 자동 판별
+      String deviceName = device.platformName.isNotEmpty 
+          ? device.platformName 
+          : device.remoteId.str;
+      String deviceNameUpper = deviceName.toUpperCase();
+      
+      bool connectAsIMU = false;
+      bool connectAsFSR = false;
+      
+      // 1. 기기 이름에 따른 자동 판별
+      if (deviceNameUpper.contains('IMU')) {
+        connectAsIMU = (_imuDevice == null);
+        if (!connectAsIMU) {
+          setState(() {
+            _isConnecting = false;
+            _currentPosture = 'IMU 모듈이 이미 연결되어 있습니다. 기존 연결을 해제하고 다시 시도하세요.';
+          });
+          return;
+        }
+      } else if (deviceNameUpper.contains('FSR')) {
+        connectAsFSR = (_fsrDevice == null);
+        if (!connectAsFSR) {
+          setState(() {
+            _isConnecting = false;
+            _currentPosture = 'FSR 모듈이 이미 연결되어 있습니다. 기존 연결을 해제하고 다시 시도하세요.';
+          });
+          return;
+        }
+      } else {
+        // 2. 기기 이름으로 판별할 수 없는 경우 빈 슬롯에 순서대로 연결
+        connectAsIMU = (_imuDevice == null);
+        connectAsFSR = (_fsrDevice == null && !connectAsIMU);
+        
+        if (!connectAsIMU && !connectAsFSR) {
+          setState(() {
+            _isConnecting = false;
+            _currentPosture = '이미 두 모듈이 모두 연결되어 있습니다. 기존 연결을 해제하고 다시 시도하세요.';
+          });
+          return;
+        }
       }
 
       String moduleType = connectAsIMU ? "IMU" : "FSR";
-      print(
-        '📞 $moduleType 모듈로 장치 연결 시도: ${device.platformName} (${device.remoteId})',
-      );
+      print('🔍 기기 이름 분석: "$deviceName" -> 타입: $moduleType');
+      print('📞 $moduleType 모듈로 장치 연결 시도: ${device.platformName} (${device.remoteId})');
+      print('📊 현재 연결 상태 - IMU: ${_imuDevice?.platformName ?? "연결안됨"}, FSR: ${_fsrDevice?.platformName ?? "연결안됨"}');
       print('📞 장치 연결 시도: ${device.platformName} (${device.remoteId})');
       await device.connect(timeout: Duration(seconds: 10));
       print('✅ 기기에 연결됨: ${device.platformName}');
@@ -321,24 +405,30 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
                 _imuSubscription?.cancel();
                 _imuSubscription = characteristic.value.listen(
                   (value) {
-                    print('📥 IMU 데이터 수신: ${value.length}바이트');
+                    print(
+                      '📥 IMU 데이터 수신: ${value.length}바이트 - ${DateTime.now()}',
+                    );
                     _handleBluetoothData(value, 'IMU');
                   },
                   onError: (error) {
                     print('❌ IMU 데이터 수신 오류: $error');
                   },
                 );
+                print('✅ IMU 데이터 수신 채널 설정 완료');
               } else if (connectAsFSR) {
                 _fsrSubscription?.cancel();
                 _fsrSubscription = characteristic.value.listen(
                   (value) {
-                    print('📥 FSR 데이터 수신: ${value.length}바이트');
+                    print(
+                      '📥 FSR 데이터 수신: ${value.length}바이트 - ${DateTime.now()}',
+                    );
                     _handleBluetoothData(value, 'FSR');
                   },
                   onError: (error) {
                     print('❌ FSR 데이터 수신 오류: $error');
                   },
                 );
+                print('✅ FSR 데이터 수신 채널 설정 완료');
               }
 
               print('✅ 데이터 수신 채널 설정됨: ${characteristic.uuid}');
@@ -377,7 +467,7 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
       if (connectAsFSR) {
         print('📤 FSR 모듈에 데이터 전송 요청...');
         await Future.delayed(Duration(seconds: 1)); // 연결 안정화 대기
-        await _sendCommandToDevice(device, '{"command": "request_fsr_data"}');
+        await _sendCommandToFSR('{"command": "request_fsr_data"}');
       }
     } catch (e) {
       print('❌ 연결 오류 상세: $e');
@@ -440,6 +530,14 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
         return;
       }
 
+      // 진동 관련 메시지는 화면에 표시하지 않음
+      if (dataString.toLowerCase().contains('vibrat') ||
+          dataString.toLowerCase().contains('motor') ||
+          dataString.toLowerCase().contains('buzz')) {
+        print('🔇 진동 관련 메시지 - 화면 표시 생략: $dataString');
+        return;
+      }
+
       // 기타 상태 메시지 처리
       if (mounted) {
         setState(() {
@@ -452,6 +550,22 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
     try {
       Map<String, dynamic> jsonData = jsonDecode(dataString);
       print('✅ JSON 파싱 성공: $jsonData');
+
+      // 진동 관련 JSON 응답은 화면에 표시하지 않음
+      if (jsonData.containsKey('command') &&
+          (jsonData['command'] == 'vibrate' ||
+              jsonData['command'] == 'vibration_complete' ||
+              jsonData['command'] == 'motor_status')) {
+        print('🔇 진동 JSON 응답 - 화면 표시 생략: $jsonData');
+        return;
+      }
+
+      if (jsonData.containsKey('status') &&
+          (jsonData['status'].toString().toLowerCase().contains('vibrat') ||
+              jsonData['status'].toString().toLowerCase().contains('motor'))) {
+        print('🔇 진동 상태 JSON 응답 - 화면 표시 생략: $jsonData');
+        return;
+      }
 
       // 모듈 상태 응답 처리
       if (jsonData.containsKey('module') && jsonData.containsKey('status')) {
@@ -469,6 +583,14 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
     } catch (e) {
       print('❌ JSON 파싱 오류: $e');
       print('📝 JSON이 아닌 원본 메시지로 처리: $dataString');
+
+      // 진동 관련 메시지는 화면에 표시하지 않음
+      if (dataString.toLowerCase().contains('vibrat') ||
+          dataString.toLowerCase().contains('motor') ||
+          dataString.toLowerCase().contains('buzz')) {
+        print('🔇 진동 관련 파싱 실패 메시지 - 화면 표시 생략: $dataString');
+        return;
+      }
 
       // JSON 파싱 실패 시 원본 메시지를 상태로 표시
       if (mounted) {
@@ -513,93 +635,100 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
     int timestamp = data['timestamp'] ?? 0;
 
     print('📊 측정 데이터 수신: $module - timestamp: $timestamp');
-    print(
-      '📊 현재 IMU 버퍼 크기: ${_imuBuffer.length}, FSR 버퍼 크기: ${_fsrBuffer.length}',
-    );
 
-    Map<String, dynamic> dataPoint = {
-      'module': module,
-      'value': value,
-      'timestamp': timestamp,
-      'received_at': DateTime.now().millisecondsSinceEpoch,
-    };
+    // 타임스탬프를 초 단위로 정규화 (같은 초의 데이터를 페어링)
+    int normalizedTimestamp = (timestamp / 1000).floor();
 
-    // 모듈별로 버퍼에 저장
+    // 타임스탬프별 데이터 페어 생성 또는 업데이트
+    if (!_timestampPairs.containsKey(normalizedTimestamp)) {
+      _timestampPairs[normalizedTimestamp] = {
+        'timestamp': normalizedTimestamp,
+        'IMU': null,
+        'FSR': null,
+        'received_at': DateTime.now().millisecondsSinceEpoch,
+      };
+    }
+
+    // 모듈별 데이터 저장
     if (module.toUpperCase() == 'IMU') {
-      _imuBuffer.add(dataPoint);
-      if (_imuBuffer.length > 10) _imuBuffer.removeAt(0);
-      print('✅ IMU 데이터 버퍼에 저장됨 - 현재 ${_imuBuffer.length}개');
+      _timestampPairs[normalizedTimestamp]!['IMU'] = value;
+      print('✅ IMU 데이터 저장됨 - timestamp: $normalizedTimestamp');
     } else if (module.toUpperCase() == 'FSR') {
-      _fsrBuffer.add(dataPoint);
-      if (_fsrBuffer.length > 10) _fsrBuffer.removeAt(0);
-      print('✅ FSR 데이터 버퍼에 저장됨 - 현재 ${_fsrBuffer.length}개');
+      _timestampPairs[normalizedTimestamp]!['FSR'] = value;
+      print('✅ FSR 데이터 저장됨 - timestamp: $normalizedTimestamp');
     } else {
       print('⚠️ 알 수 없는 모듈 타입: $module');
+      return;
     }
 
-    _processDataWindow();
+    // 페어가 완성되면 바로 서버로 전송
+    var pair = _timestampPairs[normalizedTimestamp]!;
+    if (pair['IMU'] != null && pair['FSR'] != null) {
+      print('📍 완성된 데이터 페어 발견 - timestamp: $normalizedTimestamp');
+      _sendPairToServer(pair);
+      _timestampPairs.remove(normalizedTimestamp);
+    }
+
+    // 오래된 미완성 페어 정리 (5초 이상 된 것들)
+    _cleanupOldPairs();
   }
 
-  void _processDataWindow() {
-    print(
-      '🔍 데이터 윈도우 처리 시작 - IMU: ${_imuBuffer.length}개, FSR: ${_fsrBuffer.length}개',
-    );
+  void _addToBuffer(Map<String, dynamic> pair) {
+    _windowData.add(pair);
+    if (_windowData.length > 3) _windowData.removeAt(0);
+    print('� 윈도우 버퍼에 추가됨 - 현재 ${_windowData.length}개');
+  }
 
-    if (_imuBuffer.length >= 3 && _fsrBuffer.length >= 3) {
-      List<Map<String, dynamic>> recentIMU = _imuBuffer.take(3).toList();
-      List<Map<String, dynamic>> recentFSR = _fsrBuffer.take(3).toList();
-
-      List<double> avgIMU = _calculateAverageIMU(recentIMU);
-      List<double> avgFSR = _calculateAverageFSR(recentFSR);
-
-      Map<String, dynamic> serverData = {
-        'id': _dataId++,
-        'device_id':
-            '${_imuDevice?.remoteId.str ?? "unknown"}_${_fsrDevice?.remoteId.str ?? "unknown"}',
-        'IMU': avgIMU,
-        'FSR': avgFSR,
-      };
-
-      if (_isSocketConnected) {
-        _sendDataToServer(serverData);
+  void _cleanupOldPairs() {
+    int currentTime = DateTime.now().millisecondsSinceEpoch;
+    _timestampPairs.removeWhere((timestamp, pair) {
+      int ageMs = currentTime - (pair['received_at'] as int);
+      bool isOld = ageMs > 5000; // 5초 이상 된 것들
+      if (isOld) {
+        print('🗑️ 오래된 미완성 페어 정리 - timestamp: $timestamp');
       }
+      return isOld;
+    });
+  }
 
-      print('📤 서버 전송 데이터: $serverData');
+  void _sendPairToServer(Map<String, dynamic> pair) {
+    print('📤 실시간 데이터 서버 전송 시작');
+
+    var imuValue = pair['IMU'];
+    var fsrValue = pair['FSR'];
+
+    if (imuValue == null || fsrValue == null) {
+      print('❌ IMU 또는 FSR 데이터가 없습니다');
+      return;
+    }
+
+    // IMU 데이터 처리 (relative pitch)
+    double relativePitch = 0.0;
+    if (imuValue is List && imuValue.isNotEmpty) {
+      relativePitch = (imuValue[0] as num).toDouble();
+    }
+
+    // FSR 데이터 처리
+    List<double> fsrData = [];
+    if (fsrValue is List) {
+      fsrData = fsrValue.map<double>((v) => (v as num).toDouble()).toList();
+    }
+
+    Map<String, dynamic> serverData = {
+      'id': _dataId++,
+      'device_id':
+          '${_imuDevice?.remoteId.str ?? "unknown"}_${_fsrDevice?.remoteId.str ?? "unknown"}',
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+      'IMU': {'relativePitch': relativePitch},
+      'FSR': fsrData,
+    };
+
+    if (_isSocketConnected) {
+      _sendDataToServer(serverData);
+      print('✅ 실시간 데이터 전송 완료: $serverData');
     } else {
-      print(
-        '⏳ 데이터 부족 - IMU: ${_imuBuffer.length}/3, FSR: ${_fsrBuffer.length}/3 (전송 대기)',
-      );
+      print('❌ 서버 연결되지 않음 - 데이터 전송 실패');
     }
-  }
-
-  List<double> _calculateAverageIMU(List<Map<String, dynamic>> data) {
-    if (data.isEmpty) return [];
-
-    List<double> sum = List.filled(data[0]['value'].length, 0.0);
-
-    for (var item in data) {
-      List<dynamic> values = item['value'];
-      for (int i = 0; i < values.length && i < sum.length; i++) {
-        sum[i] += (values[i] as num).toDouble();
-      }
-    }
-
-    return sum.map((s) => s / data.length).toList();
-  }
-
-  List<double> _calculateAverageFSR(List<Map<String, dynamic>> data) {
-    if (data.isEmpty) return [];
-
-    List<double> sum = List.filled(data[0]['value'].length, 0.0);
-
-    for (var item in data) {
-      List<dynamic> values = item['value'];
-      for (int i = 0; i < values.length && i < sum.length; i++) {
-        sum[i] += (values[i] as num).toDouble();
-      }
-    }
-
-    return sum.map((s) => s / data.length).toList();
   }
 
   void _handleStatusMessage(Map<String, dynamic> data) {
@@ -638,9 +767,20 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
     }
 
     if (!_modulesReady) {
-      print('모듈이 준비되지 않았습니다. IMU: $_imuStatus, FSR: $_fsrStatus');
+      print('❌ 모듈이 준비되지 않았습니다. IMU: $_imuStatus, FSR: $_fsrStatus');
       return;
     }
+
+    print('🚀 측정 시작 요청됨');
+    print('📊 현재 상태 체크:');
+    print(
+      '   - IMU 연결: ${_imuDevice != null ? "✅" : "❌"} ${_imuDevice?.platformName ?? "없음"}',
+    );
+    print(
+      '   - FSR 연결: ${_fsrDevice != null ? "✅" : "❌"} ${_fsrDevice?.platformName ?? "없음"}',
+    );
+    print('   - 서버 연결: ${_isSocketConnected ? "✅" : "❌"}');
+    print('   - 모듈 준비: ${_modulesReady ? "✅" : "❌"}');
 
     await _sendCommand('{"command": "start"}');
 
@@ -655,6 +795,9 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
         _windowData.clear();
       });
     }
+
+    // 데이터 수신 상태 모니터링 시작
+    _startDataReceptionMonitoring();
 
     _calibrationTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       if (mounted) {
@@ -678,11 +821,68 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
       setState(() {
         _isCalibrating = false;
         _isMeasuring = true;
-        _currentPosture = '측정 중... 첫 번째 자세는 정자세 기준';
+        _currentPosture = '측정 중... 첫 번째 자세는 바른 자세 기준';
         _baselinePitch = 0.0;
       });
     }
     print('✅ 캘리브레이션 완료 - 측정 시작');
+
+    // 테스트: 측정 시작 시 진동 명령 강제 전송
+    print('🧪 테스트: 측정 시작과 함께 진동 명령 전송');
+    _sendVibrationCommand();
+  }
+
+  // 데이터 수신 모니터링 함수
+  void _startDataReceptionMonitoring() {
+    print('📊 데이터 수신 모니터링 시작');
+
+    Timer.periodic(const Duration(seconds: 10), (timer) {
+      if (!_isMeasuring) {
+        timer.cancel();
+        return;
+      }
+
+      print('📊 데이터 수신 상태 체크:');
+      print('   - IMU 버퍼 크기: ${_imuBuffer.length}');
+      print('   - FSR 버퍼 크기: ${_fsrBuffer.length}');
+      print('   - 타임스탬프 페어 수: ${_timestampPairs.length}');
+      print('   - 서버 전송 데이터 수: ${_measurementData.length}');
+
+      if (_imuBuffer.isEmpty && _fsrBuffer.isEmpty) {
+        print('⚠️ 경고: 데이터를 수신하지 못하고 있습니다!');
+        print('🔄 블루투스 연결 상태 재확인...');
+        _checkBluetoothConnections();
+      }
+    });
+  }
+
+  // 블루투스 연결 상태 재확인
+  void _checkBluetoothConnections() async {
+    print('🔍 블루투스 연결 재확인 중...');
+
+    if (_imuDevice != null) {
+      try {
+        bool imuConnected = await _imuDevice!.isConnected;
+        print('📡 IMU 연결 상태: ${imuConnected ? "연결됨" : "연결 끊김"}');
+        if (!imuConnected) {
+          print('❌ IMU 연결이 끊어졌습니다. 재연결을 시도하세요.');
+        }
+      } catch (e) {
+        print('❌ IMU 연결 상태 확인 오류: $e');
+      }
+    }
+
+    if (_fsrDevice != null) {
+      try {
+        bool fsrConnected = await _fsrDevice!.isConnected;
+        print('📡 FSR 연결 상태: ${fsrConnected ? "연결됨" : "연결 끊김"}');
+        if (!fsrConnected) {
+          print('❌ FSR 연결이 끊어졌습니다. 재연결을 시도하세요.');
+        }
+      } catch (e) {
+        print('❌ FSR 연결 상태 확인 오류: $e');
+      }
+    }
   }
 
   Future<void> _sendCommand(String command) async {
@@ -703,45 +903,149 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
     await Future.wait(commands);
   }
 
+  // IMU 모듈에만 명령 전송 (진동 등 IMU 전용 기능)
+  Future<void> _sendCommandToIMU(String command) async {
+    if (_imuDevice != null) {
+      print('📤 IMU 모듈에만 명령 전송: $command');
+      await _sendCommandToDevice(_imuDevice!, command);
+    } else {
+      print('❌ IMU 모듈이 연결되지 않았습니다');
+    }
+  }
+
+  // FSR 모듈에만 명령 전송 (FSR 전용 기능)
+  Future<void> _sendCommandToFSR(String command) async {
+    if (_fsrDevice != null) {
+      print('📤 FSR 모듈에만 명령 전송: $command');
+      await _sendCommandToDevice(_fsrDevice!, command);
+    } else {
+      print('❌ FSR 모듈이 연결되지 않았습니다');
+    }
+  }
+
   Future<void> _sendCommandToDevice(
     BluetoothDevice device,
     String command,
   ) async {
     try {
       print('📤 ${device.platformName}에 명령 전송 시도: $command');
+      print('📤 장치 상태 - 연결됨: ${device.isConnected}');
 
       List<BluetoothService> services = await device.discoverServices();
-      BluetoothCharacteristic? writeCharacteristic;
+      print('📤 발견된 서비스 수: ${services.length}');
 
+      BluetoothCharacteristic? writeCharacteristic;
+      List<BluetoothCharacteristic> possibleCharacteristics = [];
+
+      // 모든 쓰기 가능한 특성 수집
       for (BluetoothService service in services) {
+        print('📤 서비스 UUID: ${service.uuid}');
         for (BluetoothCharacteristic characteristic
             in service.characteristics) {
+          print('📤 특성 UUID: ${characteristic.uuid}');
+          print(
+            '📤 특성 속성 - write: ${characteristic.properties.write}, writeWithoutResponse: ${characteristic.properties.writeWithoutResponse}',
+          );
+
           if (characteristic.properties.write ||
               characteristic.properties.writeWithoutResponse) {
-            writeCharacteristic = characteristic;
-            print('✅ 쓰기 특성 발견: ${characteristic.uuid}');
-            break;
+            possibleCharacteristics.add(characteristic);
+            print('✅ 쓰기 가능한 특성 발견: ${characteristic.uuid}');
           }
         }
-        if (writeCharacteristic != null) break;
+      }
+
+      // 첫 번째 쓰기 가능한 특성 선택
+      if (possibleCharacteristics.isNotEmpty) {
+        writeCharacteristic = possibleCharacteristics.first;
+        print('🎯 선택된 특성: ${writeCharacteristic.uuid}');
+        print(
+          '🎯 특성 속성 - write: ${writeCharacteristic.properties.write}, writeWithoutResponse: ${writeCharacteristic.properties.writeWithoutResponse}',
+        );
       }
 
       if (writeCharacteristic != null) {
-        String commandWithNewline = '$command\n';
-        List<int> bytes = commandWithNewline.codeUnits;
+        // 여러 방식으로 명령 전송 시도
+        List<String> commandVariants = [
+          command, // 개행 없이
+          '$command\n', // \n 추가
+          '$command\r\n', // \r\n 추가
+        ];
 
-        if (writeCharacteristic.properties.writeWithoutResponse) {
-          await writeCharacteristic.write(bytes, withoutResponse: true);
-        } else {
-          await writeCharacteristic.write(bytes);
+        for (int i = 0; i < commandVariants.length; i++) {
+          String cmdVariant = commandVariants[i];
+          List<int> bytes = cmdVariant.codeUnits;
+
+          print('📤 전송 시도 ${i + 1}: "$cmdVariant"');
+          print('📤 전송할 바이트 수: ${bytes.length}');
+          print('📤 전송할 바이트: $bytes');
+
+          try {
+            if (writeCharacteristic.properties.writeWithoutResponse) {
+              print('📤 writeWithoutResponse 모드로 전송');
+              await writeCharacteristic.write(bytes, withoutResponse: true);
+            } else {
+              print('📤 write 모드로 전송');
+              await writeCharacteristic.write(bytes);
+            }
+
+            print(
+              '✅ ${device.platformName}에 명령 전송 성공 (시도 ${i + 1}): $cmdVariant',
+            );
+
+            // 성공하면 다음 전송 전 잠깐 대기
+            await Future.delayed(Duration(milliseconds: 100));
+          } catch (e) {
+            print('❌ 전송 시도 ${i + 1} 실패: $e');
+          }
         }
-
-        print('✅ ${device.platformName}에 명령 전송 성공: $command');
       } else {
         print('❌ ${device.platformName}에서 쓰기 가능한 특성을 찾을 수 없습니다.');
+        print('❌ 사용 가능한 특성들:');
+        for (BluetoothService service in services) {
+          for (BluetoothCharacteristic characteristic
+              in service.characteristics) {
+            print(
+              '   - ${characteristic.uuid}: write=${characteristic.properties.write}, writeWithoutResponse=${characteristic.properties.writeWithoutResponse}',
+            );
+          }
+        }
       }
     } catch (e) {
       print('❌ ${device.platformName}에 명령 전송 오류: $e');
+      print('❌ 오류 타입: ${e.runtimeType}');
+      print('❌ 오류 상세: ${e.toString()}');
+    }
+  }
+
+  Future<void> _sendVibrationCommand() async {
+    print('🔥 진동 명령 전송 함수 호출됨!');
+
+    // IMU 모듈에만 진동 명령 전송 (FSR 모듈에는 진동 기능 없음)
+    if (_imuDevice != null) {
+      print(
+        '✅ IMU 장치 확인됨: ${_imuDevice!.platformName} (${_imuDevice!.remoteId.str})',
+      );
+
+      // 간단한 진동 명령만 전송 (다른 앱과 동일한 방식)
+      String vibrationCommand = '{"command":"vibrate"}';
+
+      try {
+        print('📤 진동 명령 전송 시작...');
+        print('📤 대상 장치: ${_imuDevice!.platformName}');
+
+        // 간단한 vibrate 명령만 전송
+        print('📤 명령 내용: $vibrationCommand');
+        await _sendCommandToIMU(vibrationCommand);
+        print('🎯 IMU 모듈에 vibrate 명령 전송 완료');
+      } catch (e) {
+        print('❌ IMU 모듈 진동 명령 전송 실패: $e');
+        print('❌ 오류 스택: ${e.toString()}');
+      }
+    } else {
+      print('⚠️ IMU 모듈이 연결되지 않아 진동 명령을 전송할 수 없습니다');
+      print('⚠️ _imuDevice 상태: $_imuDevice');
+      print('⚠️ _fsrDevice 상태: $_fsrDevice');
     }
   }
 
@@ -764,10 +1068,10 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
 
   void _connectToServer() {
     try {
-      print('WebSocket 서버 연결 시도: ws://3.34.159.75:8000/ws');
+      print('WebSocket 서버 연결 시도: ws://3.34.159.75:8765/ws');
 
       _webSocket = WebSocketChannel.connect(
-        Uri.parse('ws://3.34.159.75:8000/ws'),
+        Uri.parse('ws://3.34.159.75:8765/ws'),
       );
 
       print('WebSocket 연결 시도 중...');
@@ -833,8 +1137,26 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
       print('📥 서버로부터 예측 결과 수신: $data');
 
       if (data is Map) {
+        // 에러 응답 처리
+        if (data.containsKey('error')) {
+          String error = data['error'] ?? '알 수 없는 오류';
+          print('❌ 서버 오류: $error');
+          if (mounted) {
+            setState(() {
+              _serverPosture = '서버 오류: $error';
+            });
+          }
+          return;
+        }
+
+        // 정상 응답 처리
         int posture = data['posture'] ?? 0;
-        double confidence = (data['confidence']?.toDouble() ?? 0.0) * 100;
+        double confidence = (data['confidence']?.toDouble() ?? 0.0);
+
+        // confidence가 0~1 범위인지 확인하고 퍼센트로 변환
+        if (confidence <= 1.0) {
+          confidence *= 100;
+        }
 
         if (mounted) {
           setState(() {
@@ -842,16 +1164,21 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
             _confidence = confidence;
 
             if (_isMeasuring) {
-              if (_measurementData.isEmpty) {
-                _currentPosture = '0번 자세 (정자세)';
-              } else {
-                _currentPosture =
-                    '${posture}번 자세 (${_getPostureText(posture)})';
-              }
+              _currentPosture = '${posture}번 자세 (${_getPostureText(posture)})';
             } else {
               _currentPosture = _serverPosture;
             }
           });
+        }
+
+        // 바른 자세가 아닌 경우 진동 명령 전송
+        if (posture != 0 && _isMeasuring) {
+          print('🚨 바른 자세가 아님 감지! 자세번호: $posture, 측정중: $_isMeasuring');
+          _sendVibrationCommand();
+        } else if (posture == 0 && _isMeasuring) {
+          print('✅ 바른 자세 감지 - 진동 안함 (자세번호: $posture)');
+        } else {
+          print('ℹ️ 진동 조건 확인: 자세번호=$posture, 측정중=$_isMeasuring (진동 안함)');
         }
 
         print(
@@ -866,21 +1193,21 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
   String _getPostureText(int postureIndex) {
     switch (postureIndex) {
       case 0:
-        return '정자세';
+        return '바른 자세';
       case 1:
-        return '거북목';
+        return '거북목 자세';
       case 2:
-        return '왼쪽 기울임';
+        return '목 숙이기';
       case 3:
-        return '오른쪽 기울임';
+        return '앞으로 당겨 기대기';
       case 4:
-        return '앞으로 숙임';
+        return '오른쪽으로 기대기';
       case 5:
-        return '뒤로 젖힘';
+        return '왼쪽으로 기대기';
       case 6:
-        return '복합 자세';
+        return '오른쪽 다리 꼬기';
       case 7:
-        return '심한 불량 자세';
+        return '왼쪽 다리 꼬기';
       default:
         return '알 수 없음';
     }
@@ -895,6 +1222,7 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
     _calibrationTimer?.cancel();
     _measurementTimer?.cancel();
     _dataWindowTimer?.cancel();
+    _pairingCleanupTimer?.cancel();
     _pulseController.dispose();
     _rotationController.dispose();
     _webSocket?.sink.close();
@@ -969,11 +1297,6 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
                   padding: const EdgeInsets.all(20),
                   child: Column(
                     children: [
-                      // 주간 통계 버튼
-                      _buildReportButton(),
-
-                      const SizedBox(height: 20),
-
                       // 스캔 및 장치 목록 - 모든 모듈이 연결되지 않은 경우 표시
                       if (_imuDevice == null || _fsrDevice == null)
                         _buildScanSection(),
@@ -992,6 +1315,11 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
                       if (_isConnected) _buildServerStatusCard(),
 
                       const SizedBox(height: 20),
+
+                      // 진동 테스트 버튼 (IMU 연결 시에만 표시)
+                      if (_imuDevice != null) _buildVibrationTestButton(),
+
+                      if (_imuDevice != null) const SizedBox(height: 12),
 
                       // 측정 버튼
                       if (_isConnected) _buildMeasurementButton(currentColor),
@@ -1173,9 +1501,11 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
                       device.platformName.isNotEmpty
                           ? device.platformName
                           : '이름 없음';
-                  bool isHC06 =
+                  bool isTargetModule =
                       deviceName.toUpperCase().contains('HC-06') ||
-                      deviceName.toUpperCase().contains('HC06');
+                      deviceName.toUpperCase().contains('HC06') ||
+                      deviceName.toUpperCase().contains('IMU') ||
+                      deviceName.toUpperCase().contains('FSR');
 
                   // 이미 연결된 장치인지 확인
                   bool isAlreadyConnected =
@@ -1201,13 +1531,13 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
                           padding: const EdgeInsets.all(16),
                           decoration: BoxDecoration(
                             color:
-                                isHC06
+                                isTargetModule
                                     ? const Color(0xFF48BB78).withOpacity(0.05)
                                     : const Color(0xFFF7FAFC),
                             borderRadius: BorderRadius.circular(12),
                             border: Border.all(
                               color:
-                                  isHC06
+                                  isTargetModule
                                       ? const Color(0xFF48BB78).withOpacity(0.3)
                                       : const Color(0xFFE2E8F0),
                               width: 1,
@@ -1219,7 +1549,7 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
                                 padding: const EdgeInsets.all(8),
                                 decoration: BoxDecoration(
                                   color:
-                                      isHC06
+                                      isTargetModule
                                           ? const Color(
                                             0xFF48BB78,
                                           ).withOpacity(0.1)
@@ -1229,9 +1559,9 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
                                   borderRadius: BorderRadius.circular(8),
                                 ),
                                 child: Icon(
-                                  isHC06 ? Icons.star : Icons.bluetooth,
+                                  isTargetModule ? Icons.star : Icons.bluetooth,
                                   color:
-                                      isHC06
+                                      isTargetModule
                                           ? const Color(0xFF48BB78)
                                           : const Color(0xFF4A90E2),
                                   size: 18,
@@ -1255,7 +1585,7 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
                                             overflow: TextOverflow.ellipsis,
                                           ),
                                         ),
-                                        if (isHC06) ...[
+                                        if (isTargetModule) ...[
                                           const SizedBox(width: 8),
                                           Container(
                                             padding: const EdgeInsets.symmetric(
@@ -1268,7 +1598,7 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
                                                   BorderRadius.circular(8),
                                             ),
                                             child: Text(
-                                              'HC-06',
+                                              _getDeviceTypeLabel(device),
                                               style: TextStyle(
                                                 color: Colors.white,
                                                 fontSize: 10,
@@ -1803,6 +2133,77 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
     );
   }
 
+  Widget _buildVibrationTestButton() {
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xFFE53E3E).withOpacity(0.2),
+            blurRadius: 12,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: () async {
+            print('🧪 진동 테스트 버튼 클릭됨');
+
+            // 사용자에게 진동 테스트 시작 알림
+            if (mounted) {
+              setState(() {
+                _currentPosture = '🧪 진동 테스트 중...';
+              });
+            }
+
+            await _sendVibrationCommand();
+
+            // 테스트 완료 후 메시지 복구
+            await Future.delayed(Duration(seconds: 2));
+            if (mounted && !_isMeasuring) {
+              setState(() {
+                _currentPosture = '진동 테스트 완료 - 연결 상태 확인';
+              });
+            }
+          },
+          borderRadius: BorderRadius.circular(12),
+          child: Container(
+            padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+            decoration: BoxDecoration(
+              color: const Color(0xFFE53E3E),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(4),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Icon(Icons.vibration, color: Colors.white, size: 18),
+                ),
+                const SizedBox(width: 12),
+                Text(
+                  '🧪 진동 테스트',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildMeasurementButton(Color currentColor) {
     bool canStartMeasurement =
         _isSocketConnected && _isConnected && _modulesReady;
@@ -1893,7 +2294,8 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
     if (_isCalibrating) return const Color(0xFF4A90E2);
     if (!_isSocketConnected) return const Color(0xFFED8936);
 
-    if (_currentPosture.contains('정자세') || _currentPosture.contains('0번 자세')) {
+    if (_currentPosture.contains('바른 자세') ||
+        _currentPosture.contains('0번 자세')) {
       return const Color(0xFF48BB78);
     } else if (_currentPosture.contains('번 자세')) {
       return const Color(0xFFE53E3E);
@@ -1902,70 +2304,5 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
     if (_confidence > 80) return const Color(0xFF48BB78);
     if (_confidence > 60) return const Color(0xFF4A90E2);
     return const Color(0xFFED8936);
-  }
-
-  Widget _buildReportButton() {
-    return Container(
-      width: double.infinity,
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: const Color(0xFF48BB78).withOpacity(0.2),
-            blurRadius: 12,
-            offset: const Offset(0, 6),
-          ),
-        ],
-      ),
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          onTap: () {
-            Navigator.push(
-              context,
-              MaterialPageRoute(builder: (context) => const ReportScreen()),
-            );
-          },
-          borderRadius: BorderRadius.circular(16),
-          child: Container(
-            padding: const EdgeInsets.symmetric(vertical: 16),
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [const Color(0xFF48BB78), const Color(0xFF38A169)],
-              ),
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Container(
-                  padding: const EdgeInsets.all(6),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(0.2),
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  child: const Icon(
-                    Icons.analytics_outlined,
-                    color: Colors.white,
-                    size: 20,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                const Text(
-                  '📊 주간 통계 보기',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
   }
 }
