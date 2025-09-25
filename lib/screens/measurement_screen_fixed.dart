@@ -20,6 +20,9 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
   BluetoothDevice? _fsrDevice;
   StreamSubscription<List<int>>? _imuSubscription;
   StreamSubscription<List<int>>? _fsrSubscription;
+  final Map<String, BluetoothDevice> _discoveredDeviceMap = {};
+  final Set<String> _preferredDeviceIds = {};
+  static const Set<String> _targetKeywords = {'IMU', 'FSR', 'HC-06', 'HC06'};
   bool _isScanning = false;
   bool _isConnecting = false;
   String _currentPosture = '연결 대기 중';
@@ -129,6 +132,46 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
     return 'MODULE';
   }
 
+  bool _matchesTargetKeyword(String nameUpper) {
+    for (final keyword in _targetKeywords) {
+      if (nameUpper.contains(keyword)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  List<BluetoothDevice> _sortedDiscoveredDevices() {
+    final devices = _discoveredDeviceMap.values
+        .where((device) => device.platformName.isNotEmpty)
+        .toList();
+    devices.sort((a, b) {
+      final nameA = a.platformName.toUpperCase();
+      final nameB = b.platformName.toUpperCase();
+
+      final bool priorityA =
+          _preferredDeviceIds.contains(a.remoteId.str) || _matchesTargetKeyword(nameA);
+      final bool priorityB =
+          _preferredDeviceIds.contains(b.remoteId.str) || _matchesTargetKeyword(nameB);
+
+      if (priorityA && !priorityB) return -1;
+      if (!priorityA && priorityB) return 1;
+
+      return nameA.compareTo(nameB);
+    });
+    return devices;
+  }
+
+  void _rememberPreferredDevice(BluetoothDevice device) {
+    final String deviceName = device.platformName.trim();
+    if (deviceName.isEmpty) {
+      return;
+    }
+    final String deviceId = device.remoteId.str;
+    _preferredDeviceIds.add(deviceId);
+    _discoveredDeviceMap[deviceId] = device;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -201,109 +244,100 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
   Future<void> _startScan() async {
     if (_isScanning) return;
 
+    _discoveredDeviceMap.clear();
+
+    if (_imuDevice != null) {
+      _rememberPreferredDevice(_imuDevice!);
+    }
+    if (_fsrDevice != null) {
+      _rememberPreferredDevice(_fsrDevice!);
+    }
+
     setState(() {
       _isScanning = true;
-      _devicesList.clear();
-      _currentPosture = '주변 장치 스캔 중...';
+      _currentPosture = '주변 블루투스 장치 스캔 중...';
+      _devicesList = _sortedDiscoveredDevices();
     });
 
     try {
-      // 기존 스캔 중지
       await FlutterBluePlus.stopScan();
 
-      print('📡 블루투스 스캔 시작...');
-
-      var subscription = FlutterBluePlus.scanResults.listen(
+      final subscription = FlutterBluePlus.scanResults.listen(
         (results) {
-          print('스캔 결과: ${results.length}개 장치 발견');
+          bool updated = false;
 
-          Set<String> deviceIds = {};
-          List<BluetoothDevice> uniqueDevices = [];
+          if (results.isNotEmpty) {
+            print('스캔 결과: ${results.length}개 장치 감지');
+          }
 
-          for (var result in results) {
-            BluetoothDevice device = result.device;
-            String deviceId = device.remoteId.str;
+          for (final result in results) {
+            final device = result.device;
+            final String deviceId = device.remoteId.str;
+            final String deviceName = device.platformName.trim();
+            if (deviceName.isEmpty) {
+              continue;
+            }
 
-            // 중복 제거
-            if (!deviceIds.contains(deviceId)) {
-              deviceIds.add(deviceId);
-              uniqueDevices.add(device);
+            final previousDevice = _discoveredDeviceMap[deviceId];
+            _discoveredDeviceMap[deviceId] = device;
 
-              String deviceName =
-                  device.platformName.isNotEmpty
-                      ? device.platformName
-                      : '이름 없음';
-              print('발견된 장치: $deviceName ($deviceId) - RSSI: ${result.rssi}');
+            if (previousDevice == null ||
+                previousDevice.platformName != device.platformName) {
+              print(
+                '발견된 장치: ${deviceName} (${deviceId}) - RSSI: ${result.rssi}',
+              );
+              updated = true;
             }
           }
 
-          // FSR, IMU, HC-06 모듈을 최상단에 정렬
-          uniqueDevices.sort((a, b) {
-            String nameA = a.platformName.toUpperCase();
-            String nameB = b.platformName.toUpperCase();
-
-            bool isTargetA =
-                nameA.contains('FSR') ||
-                nameA.contains('IMU') ||
-                nameA.contains('HC-06') ||
-                nameA.contains('HC06');
-            bool isTargetB =
-                nameB.contains('FSR') ||
-                nameB.contains('IMU') ||
-                nameB.contains('HC-06') ||
-                nameB.contains('HC06');
-
-            // FSR, IMU, HC-06 모듈이 먼저 오도록 정렬
-            if (isTargetA && !isTargetB) return -1;
-            if (!isTargetA && isTargetB) return 1;
-
-            // 모두 타겟 모듈이거나 모두 아닌 경우 이름순 정렬
-            return nameA.compareTo(nameB);
-          });
-
-          if (mounted) {
+          if (updated && mounted) {
             setState(() {
-              _devicesList = uniqueDevices;
+              _devicesList = _sortedDiscoveredDevices();
             });
           }
         },
-        onError: (e) {
-          print('❌ 스캔 오류: $e');
-          setState(() {
-            _isScanning = false;
-            _currentPosture = '스캔 오류: $e';
-          });
+        onError: (error) {
+          print('블루투스 스캔 오류: ${error}');
+          if (mounted) {
+            setState(() {
+              _isScanning = false;
+              _currentPosture = '스캔 오류: ${error}';
+            });
+          }
         },
       );
 
-      // 스캔 시작
       await FlutterBluePlus.startScan(
         timeout: const Duration(seconds: 8),
-        withServices: [],
-        withNames: [],
+        withServices: const [],
+        withNames: const [],
         androidUsesFineLocation: true,
       );
 
-      // 스캔 완료 후 정리
-      await Future.delayed(Duration(seconds: 9)); // 타임아웃 + 1초
+      await Future.delayed(const Duration(seconds: 9));
       await subscription.cancel();
-      await FlutterBluePlus.stopScan(); // 확실히 스캔 중지
+      await FlutterBluePlus.stopScan();
 
-      setState(() {
-        _isScanning = false;
-        if (_devicesList.isEmpty) {
-          _currentPosture = '주변에서 블루투스 장치를 찾을 수 없습니다';
-        } else {
-          _currentPosture =
-              '${_devicesList.length}개의 장치를 발견했습니다. 연결할 장치를 선택하세요.';
-        }
-      });
+      if (mounted) {
+        setState(() {
+          _isScanning = false;
+          _devicesList = _sortedDiscoveredDevices();
+          if (_devicesList.isEmpty) {
+            _currentPosture = '주변에서 블루투스 장치를 찾을 수 없습니다.';
+          } else {
+            _currentPosture =
+                '${_devicesList.length}개의 장치를 발견했습니다. 연결할 장치를 선택하세요.';
+          }
+        });
+      }
     } catch (e) {
-      print('❌ 블루투스 스캔 오류: $e');
-      setState(() {
-        _isScanning = false;
-        _currentPosture = '스캔 오류: $e';
-      });
+      print('블루투스 스캔 예외: ${e}');
+      if (mounted) {
+        setState(() {
+          _isScanning = false;
+          _currentPosture = '스캔 오류: ${e}';
+        });
+      }
     }
   }
 
@@ -450,6 +484,8 @@ class _MeasurementScreenFixedState extends State<MeasurementScreenFixed>
         } else if (connectAsFSR) {
           _fsrDevice = device;
         }
+        _rememberPreferredDevice(device);
+        _devicesList = _sortedDiscoveredDevices();
         _isConnecting = false;
         String deviceName =
             device.platformName.isNotEmpty
